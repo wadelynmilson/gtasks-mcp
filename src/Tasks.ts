@@ -196,9 +196,9 @@ export class TaskActions {
     if (taskStatus) task.status = taskStatus;
     if (taskDue) task.due = normalizeDueDate(taskDue)!;
 
-    const taskResponse = await tasks.tasks.update({
+    const taskResponse = await tasks.tasks.patch({
       tasklist: taskListId,
-      task: taskUri,
+      task: taskId,
       requestBody: task,
     });
 
