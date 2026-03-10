@@ -163,6 +163,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "list-tasklists",
+        description: "List all task lists in Google Tasks",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
         name: "update",
         description: "Update a task in Google Tasks",
         inputSchema: {
@@ -213,6 +221,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (request.params.name === "list") {
     const taskResult = await TaskActions.list(request, tasks);
     return taskResult;
+  }
+  if (request.params.name === "list-tasklists") {
+    const response = await tasks.tasklists.list();
+    const taskLists = response.data.items || [];
+    const formatted = taskLists
+      .map((list) => `${list.title} (ID: ${list.id})`)
+      .join("\n");
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            taskLists.length > 0
+              ? `Found ${taskLists.length} task lists:\n${formatted}`
+              : "No task lists found",
+        },
+      ],
+    };
   }
   if (request.params.name === "create") {
     const taskResult = await TaskActions.create(request, tasks);
