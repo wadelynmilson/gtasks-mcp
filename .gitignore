@@ -1,4 +1,7 @@
 node_modules
 dist
 .gtasks-server-credentials.json
+.gtasks-credentials/
 gcp-oauth.keys.json
+.claude/
+CLAUDE.md

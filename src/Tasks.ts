@@ -1,13 +1,13 @@
 import {
   CallToolRequest,
-  CallToolResult,
   ListResourcesRequest,
   ReadResourceRequest,
 } from "@modelcontextprotocol/sdk/types.js";
-import { GaxiosResponse } from "gaxios";
 import { tasks_v1 } from "googleapis";
+import { withRetry } from "./retry.js";
 
 const MAX_TASK_RESULTS = 100;
+const VALID_STATUSES = ["needsAction", "completed"];
 
 /**
  * Normalize a due date string to RFC 3339 format expected by Google Tasks API.
@@ -18,7 +18,9 @@ export function normalizeDueDate(due: string | undefined): string | undefined {
   if (!due) return undefined;
   const parsed = new Date(due);
   if (isNaN(parsed.getTime())) {
-    throw new Error(`Invalid due date format: "${due}". Use YYYY-MM-DD or ISO 8601 format.`);
+    throw new Error(
+      `Invalid due date: "${due}". Use YYYY-MM-DD format (e.g. 2026-03-27).`,
+    );
   }
   // Google Tasks only uses the date portion, so normalize to midnight UTC
   const year = parsed.getUTCFullYear();
@@ -31,10 +33,10 @@ export class TaskResources {
   static async read(request: ReadResourceRequest, tasks: tasks_v1.Tasks) {
     const taskId = request.params.uri.replace("gtasks:///", "");
 
-    const taskListsResponse: GaxiosResponse<tasks_v1.Schema$TaskLists> =
-      await tasks.tasklists.list({
-        maxResults: MAX_TASK_RESULTS,
-      });
+    const taskListsResponse = await withRetry(
+      () => tasks.tasklists.list({ maxResults: MAX_TASK_RESULTS }),
+      "tasklists.list",
+    );
 
     const taskLists = taskListsResponse.data.items || [];
     let task: tasks_v1.Schema$Task | null = null;
@@ -42,11 +44,10 @@ export class TaskResources {
     for (const taskList of taskLists) {
       if (taskList.id) {
         try {
-          const taskResponse: GaxiosResponse<tasks_v1.Schema$Task> =
-            await tasks.tasks.get({
-              tasklist: taskList.id,
-              task: taskId,
-            });
+          const taskResponse = await withRetry(
+            () => tasks.tasks.get({ tasklist: taskList.id!, task: taskId }),
+            "tasks.get",
+          );
           task = taskResponse.data;
           break;
         } catch (error) {
@@ -75,9 +76,10 @@ export class TaskResources {
       params.pageToken = request.params.cursor;
     }
 
-    const taskListsResponse = await tasks.tasklists.list({
-      maxResults: MAX_TASK_RESULTS,
-    });
+    const taskListsResponse = await withRetry(
+      () => tasks.tasklists.list({ maxResults: MAX_TASK_RESULTS }),
+      "tasklists.list",
+    );
 
     const taskLists = taskListsResponse.data.items || [];
 
@@ -85,10 +87,10 @@ export class TaskResources {
     let nextPageToken = null;
 
     for (const taskList of taskLists) {
-      const tasksResponse = await tasks.tasks.list({
-        tasklist: taskList.id,
-        ...params,
-      });
+      const tasksResponse = await withRetry(
+        () => tasks.tasks.list({ tasklist: taskList.id, ...params }),
+        "tasks.list",
+      );
 
       const taskItems = tasksResponse.data.items || [];
       allTasks = allTasks.concat(taskItems);
@@ -103,34 +105,66 @@ export class TaskResources {
 }
 
 export class TaskActions {
-  private static formatTask(task: tasks_v1.Schema$Task) {
-    return `${task.title}\n (Due: ${task.due || "Not set"}) - Notes: ${task.notes} - ID: ${task.id} - Status: ${task.status} - URI: ${task.selfLink} - Hidden: ${task.hidden} - Parent: ${task.parent} - Deleted?: ${task.deleted} - Completed Date: ${task.completed} - Position: ${task.position} - Updated Date: ${task.updated} - ETag: ${task.etag} - Links: ${task.links} - Kind: ${task.kind}}`;
+  private static formatTask(
+    task: tasks_v1.Schema$Task & { taskListName?: string },
+  ) {
+    const lines: string[] = [];
+    lines.push(`- **${task.title || "(untitled)"}**`);
+    lines.push(`  ID: ${task.id}`);
+    lines.push(`  Status: ${task.status}`);
+    if (task.taskListName) lines.push(`  List: ${task.taskListName}`);
+    if (task.due) lines.push(`  Due: ${task.due}`);
+    if (task.notes) lines.push(`  Notes: ${task.notes}`);
+    if (task.completed) lines.push(`  Completed: ${task.completed}`);
+    if (task.parent) lines.push(`  Parent: ${task.parent}`);
+    if (task.links && Array.isArray(task.links) && task.links.length > 0) {
+      const linkStrs = task.links
+        .map((l: any) => l.link || l.description || "")
+        .filter(Boolean);
+      if (linkStrs.length > 0)
+        lines.push(`  Links: ${linkStrs.join(", ")}`);
+    }
+    return lines.join("\n");
   }
 
   private static formatTaskList(taskList: tasks_v1.Schema$Task[]) {
-    return taskList.map((task) => this.formatTask(task)).join("\n");
+    return taskList.map((task) => this.formatTask(task)).join("\n\n");
   }
 
-  private static async _list(request: CallToolRequest, tasks: tasks_v1.Tasks) {
-    const taskListsResponse = await tasks.tasklists.list({
-      maxResults: MAX_TASK_RESULTS,
-    });
+  private static async _list(
+    request: CallToolRequest,
+    tasks: tasks_v1.Tasks,
+  ) {
+    const taskListsResponse = await withRetry(
+      () => tasks.tasklists.list({ maxResults: MAX_TASK_RESULTS }),
+      "tasklists.list",
+    );
 
     const taskLists = taskListsResponse.data.items || [];
-    let allTasks: tasks_v1.Schema$Task[] = [];
+    let allTasks: (tasks_v1.Schema$Task & { taskListName?: string })[] = [];
 
     for (const taskList of taskLists) {
       if (taskList.id) {
         try {
-          const tasksResponse = await tasks.tasks.list({
-            tasklist: taskList.id,
-            maxResults: MAX_TASK_RESULTS,
-          });
+          const tasksResponse = await withRetry(
+            () =>
+              tasks.tasks.list({
+                tasklist: taskList.id!,
+                maxResults: MAX_TASK_RESULTS,
+              }),
+            "tasks.list",
+          );
 
-          const items = tasksResponse.data.items || [];
+          const items = (tasksResponse.data.items || []).map((item) => ({
+            ...item,
+            taskListName: taskList.title || taskList.id || undefined,
+          }));
           allTasks = allTasks.concat(items);
         } catch (error) {
-          console.error(`Error fetching tasks for list ${taskList.id}:`, error);
+          console.error(
+            `Error fetching tasks for list ${taskList.id}:`,
+            error,
+          );
         }
       }
     }
@@ -144,8 +178,8 @@ export class TaskActions {
     const taskNotes = request.params.arguments?.notes as string;
     const taskDue = request.params.arguments?.due as string;
 
-    if (!taskTitle) {
-      throw new Error("Task title is required");
+    if (!taskTitle || !taskTitle.trim()) {
+      throw new Error("Task title is required.");
     }
 
     const task: Record<string, string> = {
@@ -154,10 +188,10 @@ export class TaskActions {
     if (taskNotes) task.notes = taskNotes;
     if (taskDue) task.due = normalizeDueDate(taskDue)!;
 
-    const taskResponse = await tasks.tasks.insert({
-      tasklist: taskListId,
-      requestBody: task,
-    });
+    const taskResponse = await withRetry(
+      () => tasks.tasks.insert({ tasklist: taskListId, requestBody: task }),
+      "tasks.insert",
+    );
 
     return {
       content: [
@@ -173,19 +207,22 @@ export class TaskActions {
   static async update(request: CallToolRequest, tasks: tasks_v1.Tasks) {
     const taskListId =
       (request.params.arguments?.taskListId as string) || "@default";
-    const taskUri = request.params.arguments?.uri as string;
     const taskId = request.params.arguments?.id as string;
     const taskTitle = request.params.arguments?.title as string;
     const taskNotes = request.params.arguments?.notes as string;
     const taskStatus = request.params.arguments?.status as string;
     const taskDue = request.params.arguments?.due as string;
 
-    if (!taskUri) {
-      throw new Error("Task URI is required");
+    if (!taskId) {
+      throw new Error(
+        "Task ID is required. Use the 'list' tool to find task IDs.",
+      );
     }
 
-    if (!taskId) {
-      throw new Error("Task ID is required");
+    if (taskStatus && !VALID_STATUSES.includes(taskStatus)) {
+      throw new Error(
+        `Invalid status "${taskStatus}". Must be "needsAction" or "completed".`,
+      );
     }
 
     const task: Record<string, string> = {
@@ -196,11 +233,15 @@ export class TaskActions {
     if (taskStatus) task.status = taskStatus;
     if (taskDue) task.due = normalizeDueDate(taskDue)!;
 
-    const taskResponse = await tasks.tasks.patch({
-      tasklist: taskListId,
-      task: taskId,
-      requestBody: task,
-    });
+    const taskResponse = await withRetry(
+      () =>
+        tasks.tasks.patch({
+          tasklist: taskListId,
+          task: taskId,
+          requestBody: task,
+        }),
+      "tasks.patch",
+    );
 
     return {
       content: [
@@ -234,13 +275,21 @@ export class TaskActions {
     const taskId = request.params.arguments?.id as string;
 
     if (!taskId) {
-      throw new Error("Task URI is required");
+      throw new Error(
+        "Task ID is required. Use the 'list' tool to find task IDs.",
+      );
     }
 
-    await tasks.tasks.delete({
-      tasklist: taskListId,
-      task: taskId,
-    });
+    if (!taskListId) {
+      throw new Error(
+        "Task list ID is required. Use the 'list-tasklists' tool to find task list IDs.",
+      );
+    }
+
+    await withRetry(
+      () => tasks.tasks.delete({ tasklist: taskListId, task: taskId }),
+      "tasks.delete",
+    );
 
     return {
       content: [
@@ -256,6 +305,10 @@ export class TaskActions {
   static async search(request: CallToolRequest, tasks: tasks_v1.Tasks) {
     const userQuery = request.params.arguments?.query as string;
 
+    if (!userQuery || !userQuery.trim()) {
+      throw new Error("Search query is required.");
+    }
+
     const allTasks = await this._list(request, tasks);
     const filteredItems = allTasks.filter(
       (task) =>
@@ -269,7 +322,7 @@ export class TaskActions {
       content: [
         {
           type: "text",
-          text: `Found ${allTasks.length} tasks:\n${taskList}`,
+          text: `Found ${filteredItems.length} tasks matching "${userQuery}":\n\n${taskList}`,
         },
       ],
       isError: false,
@@ -280,9 +333,16 @@ export class TaskActions {
     const taskListId =
       (request.params.arguments?.taskListId as string) || "@default";
 
-    await tasks.tasks.clear({
-      tasklist: taskListId,
-    });
+    if (!taskListId) {
+      throw new Error(
+        "Task list ID is required. Use the 'list-tasklists' tool to find task list IDs.",
+      );
+    }
+
+    await withRetry(
+      () => tasks.tasks.clear({ tasklist: taskListId }),
+      "tasks.clear",
+    );
 
     return {
       content: [
